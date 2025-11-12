@@ -1,116 +1,143 @@
-# Galaxy Facilitator Vault Program
+# Galaxy Facilitator: On-Chain Metered Billing Protocol
 
-This is the on-chain "Vault" program for the Galaxy Facilitator protocol, a system for x402-style continuous, metered payments on Solana.[9, 10, 11]
+This repository contains the on-chain Anchor program for the **Galaxy Facilitator Protocol**, a non-custodial system for x402-style metered billing on Solana. [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
-This program is written in Rust using the [Anchor framework](https://www.anchor-lang.com/). [12, 13]
+It enables users to deposit funds into a personal vault and delegate spending authority to one or more "agents" (e.g., API servers, AI agents) with specific, on-chain enforced budgets. This allows for high-frequency, off-chain authorized payments without requiring the user to sign every transaction.
 
-## Overview
+## Core Concepts & Architecture
 
-The program acts as a non-custodial "budget vault."
+The protocol operates on a "leashed trust" model. The user (Authority) provisions a budget, and the agent (Server) can draw from that budget up to the specified limit. The user *always* retains custody of their funds.
 
-  * Users deposit SPL tokens into a secure, personal Program-Derived Address (PDA) vault. [14, 15, 16]
-  * A trusted off-chain server (the "agent" or "Facilitator") is given permission to make programmatic withdrawals from this vault.
-  * The user always retains the ability to withdraw all remaining funds and close their vault at any time. [17, 18, 19]
+### Key Components
 
-## On-Chain Components
+1.  **`PaymentVault` (PDA)**
 
-### Account State
+      * **Seeds**: `[b"vault", authority.key()]`
+      * **Description**: This is the user's master vault. It is a Program-Derived Address that serves as the central authority for the user's funds. It *owns* the `TokenVault`. [10, 11, 12]
 
-  * `PaymentVault`: A PDA (seeds: `[b"vault", user.key()]`) that stores the metadata for the vault, including the user's public key (`authority`), the server's public key (`agent`), and the token `mint`.
+2.  **`TokenVault` (ATA)**
 
-### Instructions
+      * **Authority**: The `PaymentVault` PDA.
+      * **Description**: This is an Associated Token Account that holds the user's *actual* SPL tokens (e.g., USDC). All agent spending is drawn from this single account. [13, 14, 15]
 
-1.  **`initialize_vault`**: Called by the **user**. Creates and funds the `PaymentVault` PDA and its associated token account.
-2.  **`spend_from_vault`**: Called by the **agent** (server). Transfers a specified `amount` of tokens from the user's `TokenVault` to the server's `TreasuryTokenAccount`. This instruction is heavily secured with `has_one` constraints to ensure the signer is the designated agent. [3, 4, 5]
-3.  **`withdraw_and_close`**: Called by the **user**. Transfers 100% of the remaining tokens from the `TokenVault` back to the user and closes both on-chain accounts, refunding the rent. [8]
+3.  **`AgentPermission` (PDA)**
 
-## Prerequisites
+      * **Seeds**: `[b"permission", authority.key(), agent.key()]`
+      * **Description**: This is the "leash." It is a separate metadata PDA that links a user (`authority`) to a specific `agent`. It stores the `budget` (total allowance) and `spent` (total consumed) for that agent. This account is the core of the multi-agent budget system. [16]
 
-Before you begin, ensure you have the following tools installed:
+## Protocol Flow
 
-  * Rust (via `rustup`) [20]
-  * Solana CLI
-  * Anchor Framework (`avm install latest` and `avm use latest`) [12]
+The system is designed for a clean separation of responsibilities between the user and the agent.
 
-## 1\. Critical Configuration (MUST DO)
+1.  **Funding (User)**: A user calls `initialize_vault` one time. This creates their `PaymentVault`, the associated `TokenVault`, and makes an initial deposit. [10, 17]
+2.  **Delegation (User)**: The user calls `authorize_agent` for *each* service (agent) they wish to use. This instruction creates (or updates) an `AgentPermission` PDA, setting a `budget` for that specific agent.
+3.  **Spending (Agent)**:
+      * A user authenticates with the agent's off-chain server (e.g., by signing an off-chain message). [18, 19, 20]
+      * The agent's server, now authorized, calls `spend_from_vault` to request payment for its service.
+      * The on-chain program verifies:
+        1.  The *signer* is the `agent` specified in the `AgentPermission` PDA. [21, 22, 23, 24]
+        2.  The requested `amount` is within the `budget - spent` limit.
+      * If valid, the program executes a CPI transfer from the user's `TokenVault` (signed by the `PaymentVault` PDA) to the agent's treasury wallet. [10, 25, 26]
+4.  **Revoking (User)**: The user calls `revoke_agent` to destroy an agent's `AgentPermission` account, instantly revoking all spending privileges and refunding the account's rent.
+5.  **Exiting (User)**: The user calls `withdraw_and_close` at any time. This is the non-custodial exit ramp. It transfers 100% of the remaining funds from the `TokenVault` back to the user and closes both the `PaymentVault` and `TokenVault` accounts. [27, 28, 29, 30]
 
-This program's security relies on hardcoding the "agent" (your server's) public key.
+## Instruction API Reference
 
-1.  **Generate a Keypair for your Server:**
-    This keypair will be used by your Node.js server to sign the `spend_from_vault` transactions. [21, 22, 23]bash
-    solana-keygen new --outfile./agent-keypair.json
+### User-Facing Instructions
 
-    ```
-    *Keep this `agent-keypair.json` file secure!* This is your server's private key.
+**1. `initialize_vault(ctx, amount: u64)`**
 
-    ```
+  * **Signer**: `authority` (User)
+  * **Description**: Creates the user's master `PaymentVault` and its `TokenVault`. Deposits an initial `amount` of tokens.
 
-2.  **Get the Server's Public Key:**
+**2. `authorize_agent(ctx, budget: u64)`**
+
+  * **Signer**: `authority` (User)
+  * **Description**: Creates or updates an `AgentPermission` PDA for a specific `agent`. Sets the total `budget` this agent is authorized to spend. Uses `init_if_needed` for seamless creation or updates. [22]
+
+**3. `revoke_agent(ctx)`**
+
+  * **Signer**: `authority` (User)
+  * **Description**: Closes an `AgentPermission` account, revoking the `agent`'s spending rights and refunding the account's rent to the `authority`.
+
+**4. `withdraw_and_close(ctx)`**
+
+  * **Signer**: `authority` (User)
+  * **Description**: The non-custodial exit. Withdraws all remaining funds from the `TokenVault` and closes the master vault accounts, refunding all rent.
+
+### Agent-Facing Instructions
+
+**5. `spend_from_vault(ctx, amount: u64)`**
+
+  * **Signer**: `agent` (Server)
+  * **Description**: Called by the agent to request payment. The program validates the request against the `AgentPermission` budget and, if successful, transfers `amount` of tokens from the user's `TokenVault` to the agent's `treasury_token_account`.
+
+## Security Model
+
+Security is enforced through Anchor's constraint system, preventing unauthorized access or spending. [31, 32]
+
+  * **`has_one`**: This is the primary constraint. `spend_from_vault` uses `has_one = authority` and `has_one = agent` on the `AgentPermission` account. This cryptographically ensures that the `agent` signing the transaction is the *exact* agent authorized by the `authority` (user) for that specific permission account. [21, 22, 23, 24]
+  * **`seeds` & `bump`**: All PDA accounts (`PaymentVault`, `AgentPermission`) are validated with their seeds and canonical bump. This prevents PDA substitution attacks, where an attacker might pass a malicious account. [16, 33]
+  * **Budget Enforcement**: All spending logic is on-chain and atomic. The check for `amount <= budget - spent` and the update to `spent` happen in the same instruction, making it impossible for an agent to overspend their budget.
+  * **Non-Custodial**: At no point does the agent or the protocol take custody of the user's funds. The `withdraw_and_close` instruction guarantees the user can reclaim their entire balance at any time. [30]
+
+## Development & Deployment
+
+### Prerequisites
+
+  * ([https://www.rust-lang.org/tools/install](https://www.rust-lang.org/tools/install))
+  * ([https://docs.solana.com/cli/install](https://docs.solana.com/cli/install))
+  * [Anchor Framework](https://www.anchor-lang.com/docs/installation) (`avm install latest` && `avm use latest`) [34]
+
+### Build
+
+Compile the program and generate the IDL (Interface Definition Language):
+
+```bash
+anchor build
+```
+
+The IDL will be generated at `target/idl/galaxy_facilitator.json`.
+
+### Test
+
+Run the local test suite:
+
+```bash
+anchor test
+```
+
+### Deploy
+
+1.  Configure your Solana CLI for the desired cluster (e.g., `devnet` or `mainnet-beta`):
 
     ```bash
-    solana-keygen pubkey./agent-keypair.json
-    # It will output a public key, e.g., "Agentp81aN1jF9n1jF9n1jF9n1jF9n1jF9n1jF9n1jF"
+    solana config set --url devnet
     ```
 
-3.  **Update the Rust Code:**
-    Open `programs/galaxy_facilitator/src/lib.rs` and find the `initialize_vault` function. Replace the placeholder public key with your server's public key from Step 2.
-
-    ```rust
-    //... inside initialize_vault...
-
-    //! CRITICAL: Replace this with your server's actual wallet public key.
-    const AGENT_PUBKEY: Pubkey = pubkey!("Agentp81aN1jF9n1jF9n1jF9n1jF9n1jF9n1jF9n1jF");
-
-    //...
-    ```
-
-## 2\. Build, Test, and Deploy
-
-Once you have configured the `AGENT_PUBKEY`, you can proceed with the standard Anchor workflow.
-
-1.  **Build the Program:**
-    This will compile the Rust code, check for errors, and generate the program's IDL (Interface Definition Language).
+2.  Ensure your deployment wallet is funded.
 
     ```bash
-    anchor build
+    solana airdrop 2 # (Devnet only)
     ```
 
-2.  **Run Local Tests (Optional but Recommended):**
-    Start a local validator in one terminal:
-
-    ```bash
-    anchor localnet
-    ```
-
-    In a second terminal, run the tests:
-
-    ```bash
-    anchor test
-    ```
-
-3.  **Deploy to a Cluster (Devnet or Mainnet):**
-    First, make sure your Solana CLI is configured for the desired cluster (e.g., `solana config set --url devnet`). Ensure your wallet has enough SOL to cover deployment fees.
-
-    Then, deploy the program:
+3.  Deploy the program:
 
     ```bash
     anchor deploy
     ```
 
-## 3\. Update Program ID
+### Post-Deployment Configuration
 
-After deployment, the CLI will output a new `Program ID`.
+The `anchor deploy` command will output a new Program ID.
 
-  * Copy this new Program ID.
-  * Paste it into `programs/galaxy_facilitator/src/lib.rs` at the `declare_id!(...)` macro.
-  * Paste it into `Anchor.toml` under the `[programs.localnet]` (or `devnet`/`mainnet`) section. [24]
-  * Run `anchor build` one more time to lock in the new Program ID.
+1.  **Update `lib.rs`**: Copy the new Program ID and paste it into the `declare_id!(...)` macro at the top of `programs/galaxy_facilitator/src/lib.rs`.
+2.  **Update `Anchor.toml`**: Paste the new Program ID into your `Anchor.toml` file, under the cluster you deployed to (e.g., `[programs.devnet]`).
 
-## 4\. Using the IDL
+Re-run `anchor build` one final time to incorporate the new Program ID into the IDL.
 
-After a successful build, the program's "ABI" (called an IDL on Solana) is generated at `target/idl/galaxy_facilitator.json`.
+## Off-Chain Integration
 
-You will need to **copy this JSON file into your Node.js "Galaxy Facilitator" server project.** The `@coral-xyz/anchor` client library will use this IDL to format and send transactions to your on-chain program. [25, 26]
+This on-chain program serves as the trust layer. The "Galaxy Facilitator" server is the off-chain component responsible for verifying user authorization (e.g., via `signMessage`) and calling the `spend_from_vault` instruction.
 
-```
-```
+The server will use the generated `target/idl/galaxy_facilitator.json` and the `@coral-xyz/anchor` Typescript library to build, sign (as the `agent` and `feePayer`), and send transactions. [35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
